@@ -486,7 +486,9 @@ public class KrollProxy implements Handler.Callback, KrollProxySupport, OnLifecy
 
 	public void initKrollObject()
 	{
-		KrollRuntime.getInstance().initObject(this);
+		if (!KrollRuntime.isDisposed()) {
+			KrollRuntime.getInstance().initObject(this);
+		}
 	}
 
 	/**
