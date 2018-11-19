@@ -7,7 +7,9 @@
 #import "KrollContext.h"
 #import "KrollCallback.h"
 #import "KrollObject.h"
+#if !(defined(USE_JSCORE_FRAMEWORK) && !defined(TI_USE_KROLL_THREAD))
 #import "KrollTimer.h"
+#endif
 #import "TiLocale.h"
 #import "TiUtils.h"
 
@@ -145,6 +147,7 @@ TiValueRef ThrowException(TiContextRef ctx, NSString *message, TiValueRef *excep
   return TiValueMakeUndefined(ctx);
 }
 
+#if !(defined(USE_JSCORE_FRAMEWORK) && !defined(TI_USE_KROLL_THREAD))
 static TiValueRef MakeTimer(TiContextRef context, TiObjectRef jsFunction, TiValueRef fnRef, TiObjectRef jsThis, TiValueRef durationRef, BOOL onetime)
 {
   static dispatch_once_t timerInitializer;
@@ -227,6 +230,7 @@ static TiValueRef SetTimeoutCallback(TiContextRef jsContext, TiObjectRef jsFunct
 
   return MakeTimer(jsContext, jsFunction, fnRef, jsThis, durationRef, YES);
 }
+#endif
 
 static TiValueRef CommonJSRequireCallback(TiContextRef jsContext, TiObjectRef jsFunction, TiObjectRef jsThis, size_t argCount,
     const TiValueRef args[], TiValueRef *exception)
@@ -765,9 +769,11 @@ static TiValueRef StringFormatDecimalCallback(TiContextRef jsContext, TiObjectRe
     lock = [[NSRecursiveLock alloc] init];
     [lock setName:[NSString stringWithFormat:@"%@ Lock", [self threadName]]];
 #endif
+#if !(defined(USE_JSCORE_FRAMEWORK) && !defined(TI_USE_KROLL_THREAD))
     timerLock = [[NSRecursiveLock alloc] init];
     NSString *timerName = [NSString stringWithFormat:@"%@ Timer Lock", [self threadName]];
     [timerLock setName:timerName];
+#endif
     stopped = YES;
     KrollContextCount++;
     debugger = NULL;
@@ -798,6 +804,7 @@ static TiValueRef StringFormatDecimalCallback(TiContextRef jsContext, TiObjectRe
   RELEASE_TO_NIL(queue);
   RELEASE_TO_NIL(krollContextId);
   RELEASE_TO_NIL(lock);
+#if !(defined(USE_JSCORE_FRAMEWORK) && !defined(TI_USE_KROLL_THREAD))
   if (timerLock != nil) {
     [timerLock lock];
     if (timers != nil) {
@@ -806,12 +813,19 @@ static TiValueRef StringFormatDecimalCallback(TiContextRef jsContext, TiObjectRe
     [timerLock unlock];
   }
   RELEASE_TO_NIL(timerLock);
+#endif
 #else
+#if !(defined(USE_JSCORE_FRAMEWORK) && !defined(TI_USE_KROLL_THREAD))
   if (timers != nil) {
     [timers removeAllObjects];
   }
 #endif
+#endif
+#if defined(USE_JSCORE_FRAMEWORK) && !defined(TI_USE_KROLL_THREAD)
+  RELEASE_TO_NIL(timerManager);
+#else
   RELEASE_TO_NIL(timers);
+#endif
 }
 
 #if CONTEXT_MEMORY_DEBUG == 1
@@ -851,6 +865,8 @@ static TiValueRef StringFormatDecimalCallback(TiContextRef jsContext, TiObjectRe
   return [[krollContextId retain] autorelease];
 }
 #endif
+
+#if !(defined(USE_JSCORE_FRAMEWORK) && !defined(TI_USE_KROLL_THREAD))
 - (void)registerTimer:(id)timer timerId:(double)timerId
 {
   [timerLock lock];
@@ -880,6 +896,7 @@ static TiValueRef StringFormatDecimalCallback(TiContextRef jsContext, TiObjectRe
   }
   [timerLock unlock];
 }
+#endif
 
 - (void)start
 {
@@ -1177,11 +1194,18 @@ static TiValueRef StringFormatDecimalCallback(TiContextRef jsContext, TiObjectRe
   [kroll release];
   TiStringRelease(prop);
 
-  [self bindCallback:@"setTimeout" callback:&SetTimeoutCallback];
+#if defined(USE_JSCORE_FRAMEWORK) && !defined(TI_USE_KROLL_THREAD)
+  JSContext *jsContext = [JSContext contextWithJSGlobalContextRef:context];
+  timerManager = [[KrollTimerManager alloc] initInContext:jsContext];
+#else
+  [self bindCallback:@"setTimeout"
+            callback:&SetTimeoutCallback];
   [self bindCallback:@"setInterval" callback:&SetIntervalCallback];
   [self bindCallback:@"clearTimeout" callback:&ClearTimerCallback];
   [self bindCallback:@"clearInterval" callback:&ClearTimerCallback];
-  [self bindCallback:@"require" callback:&CommonJSRequireCallback];
+#endif
+  [self bindCallback:@"require"
+            callback:&CommonJSRequireCallback];
   [self bindCallback:@"L" callback:&LCallback];
   [self bindCallback:@"alert" callback:&AlertCallback];
 
@@ -1407,6 +1431,9 @@ static TiValueRef StringFormatDecimalCallback(TiContextRef jsContext, TiObjectRe
     [delegate performSelector:@selector(willStopNewContext:) withObject:self];
   }
 
+#if defined(USE_JSCORE_FRAMEWORK) && !defined(TI_USE_KROLL_THREAD)
+  [timerManager invalidateAllTimers];
+#else
   [timerLock lock];
   // stop any running timers
   if (timers != nil && [timers count] > 0) {
@@ -1417,6 +1444,7 @@ static TiValueRef StringFormatDecimalCallback(TiContextRef jsContext, TiObjectRe
     [timers removeAllObjects];
   }
   [timerLock unlock];
+#endif
 
   [KrollCallback shutdownContext:self];
 
@@ -1529,3 +1557,146 @@ static TiValueRef StringFormatDecimalCallback(TiContextRef jsContext, TiObjectRe
 }
 
 @end
+
+#if defined(USE_JSCORE_FRAMEWORK) && !defined(TI_USE_KROLL_THREAD)
+
+@interface KrollTimerManager ()
+
+@property NSUInteger nextTimerIdentifier;
+
+@end
+
+@implementation KrollTimerTarget
+
+- (instancetype)initWithCallback:(JSValue *)callback arguments:(NSArray<NSValue *> *)arguments
+{
+  self = [super init];
+  if (!self) {
+    return nil;
+  }
+
+  self.callback = callback;
+  self.arguments = arguments;
+
+  return self;
+}
+
+- (void)dealloc
+{
+  [_callback release];
+  _callback = nil;
+  if (_arguments != nil) {
+    [_arguments release];
+    _arguments = nil;
+  }
+
+  [super dealloc];
+}
+
+- (void)timerFired:(NSTimer *_Nonnull)timer
+{
+  [self.callback callWithArguments:self.arguments];
+}
+
+@end
+
+@implementation KrollTimerManager
+
+- (instancetype)initInContext:(JSContext *)context
+{
+  self = [super init];
+  if (!self) {
+    return nil;
+  }
+
+  self.nextTimerIdentifier = 0;
+  self.timers = [NSMapTable strongToWeakObjectsMapTable];
+
+  NSUInteger (^setInterval)(JSValue *, double) = ^(JSValue *callback, double interval) {
+    return [self setInterval:interval withCallback:callback shouldRepeat:YES];
+  };
+  context[@"setInterval"] = setInterval;
+
+  NSUInteger (^setTimeout)(JSValue *, double) = ^(JSValue *callback, double interval) {
+    return [self setInterval:interval withCallback:callback shouldRepeat:NO];
+  };
+  context[@"setTimeout"] = setTimeout;
+
+  void (^clearInterval)(NSUInteger) = ^(NSUInteger value) {
+    return [self clearIntervalWithIdentifier:value];
+  };
+  context[@"clearInterval"] = clearInterval;
+  context[@"clearTimeout"] = clearInterval;
+
+  // This is more useful than just in timers, should be registered in some better place like KrollBridge?
+  [context setExceptionHandler:^(JSContext *context, JSValue *exception) {
+    id exc;
+    if ([exception isObject]) {
+      exc = [exception toObject]; // Hope it becomes an NSDictionary?
+    } else {
+      exc = [exception toString];
+    }
+    [[TiExceptionHandler defaultExceptionHandler] reportScriptError:[TiUtils scriptErrorValue:exc]];
+  }];
+  return self;
+}
+
+- (void)dealloc
+{
+  if (self.timers != nil) {
+    [self invalidateAllTimers];
+    [self.timers removeAllObjects];
+    [self.timers release];
+    self.timers = nil;
+  }
+
+  [super dealloc];
+}
+
+- (void)invalidateAllTimers
+{
+  NSArray<NSNumber *> *keys = [[self.timers keyEnumerator] allObjects];
+  for (NSNumber *timerIdentifier in keys) {
+    [self clearIntervalWithIdentifier:timerIdentifier.unsignedIntegerValue];
+  }
+}
+
+- (NSUInteger)setInterval:(double)interval withCallback:(JSValue *)callback shouldRepeat:(BOOL)shouldRepeat
+{
+  // interval is optional, should default to 0 per spec, but let's enforce at least 1 ms minimum (like Node)
+  if (isnan(interval) || interval < 1) {
+    interval = 1; // defaults to 1ms
+  }
+  interval = interval / 1000.0; // convert from ms to seconds
+
+  // Handle additional arguments being passed in
+  NSArray<JSValue *> *args = [JSContext currentArguments];
+  NSUInteger argCount = [args count];
+  NSArray<JSValue *> *callbackArgs = nil;
+  if (argCount > 2) {
+    callbackArgs = [args subarrayWithRange:NSMakeRange(2, argCount - 2)];
+  }
+  NSNumber *timerIdentifier = @(self.nextTimerIdentifier++);
+  KrollTimerTarget *timerTarget = [[KrollTimerTarget alloc] initWithCallback:callback arguments:callbackArgs];
+  NSTimer *timer = [NSTimer timerWithTimeInterval:interval target:timerTarget selector:@selector(timerFired:) userInfo:timerTarget repeats:shouldRepeat];
+  [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+
+  [self.timers setObject:timer forKey:timerIdentifier];
+  return [timerIdentifier unsignedIntegerValue];
+}
+
+- (void)clearIntervalWithIdentifier:(NSUInteger)identifier
+{
+  NSNumber *timerIdentifier = @(identifier);
+  NSTimer *timer = [self.timers objectForKey:timerIdentifier];
+  if (timer != nil) {
+    if ([timer isValid]) {
+      [timer invalidate];
+    }
+    [self.timers removeObjectForKey:timerIdentifier];
+  }
+}
+
+@end
+
+#endif
